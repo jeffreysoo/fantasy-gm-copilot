@@ -1,0 +1,7 @@
+allowBuilds:
+  esbuild: true
+  unrs-resolver: true
+minimumReleaseAgeExclude:
+  - '@ai-sdk/openai@4.0.67'
+  - '@ai-sdk/provider-utils@5.0.41'
+  - '@ai-sdk/provider@4.0.15'
