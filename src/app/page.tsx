@@ -316,10 +316,10 @@ export default function Home() {
     // Refresh roster in parallel with agent call so tiles are fresh
     fetchRoster();
     try {
-      const res = await fetch("/api/chat", {
+      const res = await fetch(`/api/chat/${mode}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode, ...(message ? { message } : {}) }),
+        body: JSON.stringify(message ? { message } : {}),
       });
       const data = await res.json();
 

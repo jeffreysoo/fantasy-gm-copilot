@@ -116,24 +116,96 @@
 
 ## 3. Observability & Tracing
 
-_To be completed after instrumenting with `@vercel/otel` and evaluating trace output in Vercel's dashboard._
+### 3.1 Debugging the first deploy — env var misconfiguration
 
-Planned areas of investigation:
-- Trace propagation through the agent loop (does each tool call get its own span?)
-- Visibility into AI Gateway latency vs upstream model latency
-- Error attribution: when a tool fails, does the trace show which step and which tool?
-- Cold start impact on serverless function traces
+| | |
+|---|---|
+| **Trying to do** | Deploy to Vercel and make the first successful AI agent call. |
+| **Signal needed** | A clear error linking the 500 to the missing environment variable. |
+| **Where I found it** | The deployment detail page showed `POST /api/chat` → 500, and under External APIs: "No outgoing requests." That second signal was the most useful — it proved the failure happened *before* any API call, narrowing the cause to config/env. The function logs showed: `OpenAI API key is missing`. |
+| **The answer** | The Vercel env var UI allowed saving a variable with a **blank key name** — only the value was entered. No validation error, no warning. The env var existed in the dashboard but had no name, so `process.env.AI_GATEWAY_API_KEY` was `undefined` at runtime. Fixed by editing the variable to add the key name, then redeploying. |
+
+**Observability takeaway:** The "No outgoing requests" signal in the deployment detail was genuinely helpful — it narrowed the search space immediately. But there's no "here's why this function failed" drill-down that shows which env vars were available to the function. A view connecting "function errored → env vars it tried to read → which ones were undefined" would have made this a 30-second fix instead of a 10-minute investigation.
+
+---
+
+### 3.2 CLI metrics — everything requires Observability Plus
+
+| | |
+|---|---|
+| **Trying to do** | Query function invocation counts, AI Gateway usage, and external API metrics from the Vercel CLI. |
+| **Signal needed** | Metrics data, or at minimum a clear indication of what's available on the free tier. |
+| **Where I found it** | Every `vercel metrics` query returned: `Error: Observability Plus is required for this query.` Even basic counts without `--group-by` are paywalled. The only CLI observability that works on the free tier is `vercel logs`. |
+| **The answer** | The Vercel dashboard (web UI) provides some free-tier visibility that the CLI doesn't — basic charts for functions, external APIs, etc. But programmatic access to any metric requires the paid add-on. |
+
+**Observability takeaway:** The CLI `vercel metrics schema` command happily lists 95 available metrics with all their dimensions and aggregations — but none of them are queryable on the free tier. This is misleading. The schema implies availability; the paywall only appears when you try to query. A `--plan hobby` filter on the schema output, or a note like "requires Plus" next to each metric, would set expectations correctly.
+
+---
+
+### 3.3 External APIs section — data without detail
+
+| | |
+|---|---|
+| **Trying to do** | Understand which external API calls `/api/roster` was making and how long each took. |
+| **Signal needed** | Request URLs and durations for each outbound call. |
+| **Where I found it** | The deployment detail page showed 18 GET requests under External APIs — but with **blank URLs**. Just `GET` repeated 18 times with no hostnames, paths, or durations per call. |
+| **The answer** | The data exists (Vercel clearly intercepts outbound fetches to count them), but the free tier doesn't expose the details. To debug "which API call is slow," you'd need to add your own logging or upgrade to see the `requestHostname` and `requestPath` dimensions. |
+
+**Observability takeaway:** Showing the count of external calls without the URLs is tantalizing but not actionable. It's like a doctor saying "you have 18 symptoms" without naming any of them. The information creates a question it can't answer.
+
+---
+
+### 3.4 Single route hides agent-level behavior
+
+| | |
+|---|---|
+| **Trying to do** | Determine which AI agent (lineup, waivers, trades, coordinator) was causing rate limits and slowness. |
+| **Signal needed** | Per-agent metrics — duration, error rate, token usage, model calls. |
+| **Where I found it** | Observability → Functions showed only `POST /api/chat` as a single route. All four agents were behind one endpoint, so there was no way to see "the lineup agent takes 6s but the trade agent takes 12s" or "waivers is the one getting rate-limited." |
+| **The answer** | Split the single `/api/chat` endpoint into four separate routes: `/api/chat/lineup`, `/api/chat/waivers`, `/api/chat/trades`, `/api/chat/coordinator`. Each maps to one agent. Now Vercel's per-route observability naturally segments them. This is an application architecture change driven entirely by observability needs. |
+
+**Observability takeaway:** Vercel's observability is fundamentally **route-level**. For traditional REST APIs where each route maps to one behavior, this works well. For AI agent apps where a single orchestrator endpoint delegates to multiple agents, it's blind. The fix was straightforward (split routes), but it's worth noting that the observability tool shaped the application architecture — not the other way around. The `mode` parameter approach was cleaner code, but invisible to monitoring.
+
+---
+
+### 3.5 Agent Runs, Functions, External APIs — three views, no links
+
+| | |
+|---|---|
+| **Trying to do** | Follow one user click end-to-end: button press → function invocation → AI Gateway calls → tool calls → external API calls → response. |
+| **Signal needed** | A trace waterfall connecting all layers for a single request. |
+| **Where I found it** | The three observability sections (Functions, Agent Runs/AI Gateway, External APIs) exist as silos. Functions shows duration and status. AI Gateway shows model calls and tokens. External APIs shows outbound HTTP calls. But there's no way to say "this specific POST to /api/chat/lineup triggered these 4 AI Gateway calls and these 8 external API calls." |
+| **The answer** | On the free tier, the connection must be inferred from timestamps and `console.log` output. The `@vercel/otel` package is installed but it's unclear what traces it produces or where to view them without Observability Plus. |
+
+**Observability takeaway:** For an AI agent app, the ideal trace would look like: `POST /api/chat/lineup` → `rosterAnalyst.generate()` → `Step 0: getRoster tool` → `GET api.sleeper.app/...` (200, 400ms) + `GET api.open-meteo.com/...` (200, 150ms) → `AI Gateway: gpt-4o-mini` (200, 2.1s) → `Step 1: response` → total 6.2s. Instead, you get three disconnected views of the same request. The distributed tracing story is there in principle (`@vercel/otel`, span propagation) but the free-tier dashboard doesn't stitch it together.
 
 ---
 
 ## 4. Native Observability vs External Tools
 
-_To be completed after comparing Vercel's built-in observability with external alternatives._
+### 4.1 What's visible out of the box vs what requires custom instrumentation
 
-Planned comparisons:
-- Vercel dashboard traces vs raw OpenTelemetry export
-- AI Gateway metrics vs self-instrumented LLM call tracking
-- What's visible out of the box vs what requires custom spans
+| Layer | Free tier visibility | What's missing |
+|---|---|---|
+| **Functions** | Route name, status code, duration, memory usage. Basic charts in dashboard. | Per-request detail requires clicking into individual invocations. No CLI access to metrics. |
+| **AI Gateway** | Request count (maybe — showed "no data" in CLI for 24h window). Dashboard may show more. | Token usage per model, cost breakdown, rate limit proximity — all require Plus or showed no data. |
+| **External APIs** | Count of outbound calls per invocation. | URLs, durations per call, error rates per upstream — blank in the deployment detail view. |
+| **Agent Runs** | Available in sidebar but unclear what's visible on free tier. | Couldn't determine if agent step traces are free-tier or Plus-only. |
+| **Logs** | `vercel logs` works. Console output from functions is visible. | No structured logging. The `console.log` statements in the agent code are the only runtime signal. |
+
+### 4.2 What I reached for outside Vercel
+
+- **`console.log` in agent code**: The most reliable observability signal. The agent code logs step counts, tool names, and elapsed time on every run. This shows up in `vercel logs` and is the primary way I debugged agent behavior.
+- **Vercel CLI `vercel logs`**: Used to confirm the env var fix worked and to read agent step output. This was the only CLI observability tool that worked on the free tier.
+- **`curl` against GitHub API**: Used to test the GitHub token when the MCP server failed — verified the token worked before looking at the MCP config.
+- **Browser DevTools**: Network tab to see request/response timing and status codes. Faster feedback loop than the Vercel dashboard for "did this request succeed."
+
+### 4.3 What would have saved time
+
+1. **Env var validation at deploy time**: "Your function reads `AI_GATEWAY_API_KEY` but no env var with that name is configured" — this could be static analysis.
+2. **Rate limit dashboard**: A real-time gauge showing "you've used 8/10 requests this minute" for the AI Gateway free tier.
+3. **Request-level trace linking**: Click a function invocation → see all AI Gateway calls and external API calls it triggered, in a waterfall.
+4. **App-level dimensions on metrics**: Let users tag requests with custom attributes (like `mode=lineup`) that show up in the observability UI without requiring route splitting.
 
 ---
 
@@ -158,6 +230,47 @@ Planned comparisons:
 
 ---
 
+## 6. Prompt Engineering & Agent Behavior
+
+### 6.1 Hallucination whack-a-mole — no tooling, just reading output
+
+| | |
+|---|---|
+| **Trying to do** | Get agents to only cite data from tool results, not fabricate stats. |
+| **Signal needed** | A way to compare "what the tool returned" vs "what the model cited in its response" — essentially output validation against tool call results. |
+| **Where I found it** | Manual reading. Every iteration required running the agent, reading the output, spotting a fabricated stat, then adding another line to the system prompt banning that specific behavior. Examples: the model invented snap percentages, target shares, yards-per-carry-allowed stats, and combined pass TDs + rush TDs into a single "TDs" number that made the data look wrong. |
+| **The answer** | Accumulated 7+ explicit anti-hallucination rules in the system prompt, including a banned-words list of 40+ AI slop terms. Each rule was a reaction to a specific observed failure. No systematic way to detect these — just human review of agent output. |
+
+**Observability takeaway:** This is the biggest gap in AI agent observability. There is no automated way to verify that the model's text output is grounded in the tool results it received. A "grounding score" or "citation check" that compares numbers in the output text against numbers in the tool call results would catch most of these. For example: if the model says "Robinson had 22 carries" but `getPlayerStats` returned `rush_att: 18`, that's a detectable hallucination. This is a solvable problem with structured tool results — the data is right there in the trace.
+
+---
+
+### 6.2 Agent calling tools it shouldn't — or not calling tools it should
+
+| | |
+|---|---|
+| **Trying to do** | Get agents to call the right tools, in the right order, the right number of times. |
+| **Signal needed** | Tool call traces with annotations — "expected: getRoster, getInjuries, getProjections in parallel" vs "actual: getRoster, then getWeather (redundant), then getInjuries (sequential)." |
+| **Where I found it** | Console logs showing step-by-step tool calls. Spotted issues: (1) The roster tool already embeds weather data, but the agent was also calling the standalone `getWeather` tool — wasting an API call and a step. (2) The trade agent wasn't calling `getPlayerCurrentOwner` before proposing trades, leading to trades for free agents. (3) Tools were called sequentially when they could be parallel, burning rate limit quota. |
+| **The answer** | Added explicit instructions: "weather is already embedded — do NOT call a separate weather tool," "CRITICAL — call getPlayerCurrentOwner for EVERY player you want to propose," "Call ALL THREE tools in a single parallel tool call." Each was a prompt-level fix for a behavioral bug. |
+
+**Observability takeaway:** The `console.log` statements in the agent code (step count, tool names, finish reason) were the only way to debug this. These are essentially hand-rolled traces. A proper agent trace view would show: expected tool call pattern vs actual, redundant calls, sequential-vs-parallel execution, and which steps consumed the most tokens. The Agent Runs section in Vercel observability should provide this — but it's unclear what's visible on the free tier and whether it captures tool-call-level detail or just LLM request counts.
+
+---
+
+### 6.3 Output format drift — no schema enforcement
+
+| | |
+|---|---|
+| **Trying to do** | Get consistent output formatting across agent runs — same tier structure, same player line format, same section ordering. |
+| **Signal needed** | Output schema validation or at minimum a diff between runs showing format drift. |
+| **Where I found it** | Manual comparison of outputs. The model would sometimes: add a summary paragraph at the end (banned in prompt), skip K and DEF from tier rankings, use filler adjectives instead of numbers, or invent a new section heading not in the template. |
+| **The answer** | Added increasingly specific formatting rules: "Include K and DEF in your tiers — do not skip them," "End on the last concrete point. No summary, no recap, no closing paragraph," exact per-line format templates like `**[Slot] [Player Name]** ([Team] [matchup]) — [projected_pts] pts.` |
+
+**Observability takeaway:** Every prompt rule is a past failure encoded as text. There's no way to know if the rules are being followed without reading the output. Structured output (JSON schema) would solve the format problem, but the trade-off is losing the natural language analysis that makes the agent useful. A middle ground: post-generation validation that checks "does the output contain a Tier 1/2/3 section? Does every player line include a number? Is there a paragraph after the last recommendation?" This could run as a lightweight check before returning the response.
+
+---
+
 ## Summary of Signal Gaps
 
 | Friction Point | Root Cause | Signal That Would Have Helped |
@@ -169,3 +282,11 @@ Planned comparisons:
 | SDK v7 tool loop | Behavioral breaking change, no signal | Deprecation warning on `maxSteps` with tools |
 | Rate limiting | No pre-429 visibility | `X-RateLimit-Remaining` headers, dashboard gauge |
 | ESPN UA block | Third-party silent rejection | Upstream health tracking per dependency |
+| Env var blank key name | UI allowed saving value without key | Validation error on save; env var audit at deploy time |
+| CLI metrics paywall | All metrics require Observability Plus | `vercel metrics schema` should indicate plan requirements |
+| External API URLs blank | Free tier hides request details | Show hostnames at minimum — the data is already captured |
+| Single route hides agents | Observability is route-level only | Custom attribute/tag support on metrics dimensions |
+| No cross-section linking | Functions, AI Gateway, External APIs are siloed | Request-level trace waterfall connecting all layers |
+| Model fabricates stats | No grounding check on output | Compare output numbers against tool call results |
+| Redundant/missing tool calls | No expected-vs-actual tool pattern view | Agent trace showing tool call graph per step |
+| Output format drift | No schema enforcement on free-text output | Post-generation validation or structured output |

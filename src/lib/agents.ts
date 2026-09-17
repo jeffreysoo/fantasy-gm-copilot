@@ -30,6 +30,7 @@ const gpt4oModel = gateway("openai/gpt-4o");
 export const rosterAnalyst = new ToolLoopAgent({
   model: miniModel,
   temperature: 0.15,
+  telemetry: { functionId: "roster-analyst" },
   instructions: `${PERSONA}\n${SUB_AGENT_ADDENDUM}
 
 ## Your role: Roster Analyst
@@ -78,6 +79,7 @@ Tier each player: Tier 1 (must-start), Tier 2 (solid), Tier 3 (risky/upside). Gr
 export const waiverScout = new ToolLoopAgent({
   model: geminiModel,
   temperature: 0.15,
+  telemetry: { functionId: "waiver-scout" },
   instructions: `${PERSONA}\n${SUB_AGENT_ADDENDUM}
 
 ## Your role: Waiver Scout
@@ -111,6 +113,7 @@ List adds in priority order. For each add, use this format:
 export const tradeAnalyst = new ToolLoopAgent({
   model: miniModel,
   temperature: 0.15,
+  telemetry: { functionId: "trade-analyst" },
   instructions: `${PERSONA}\n${SUB_AGENT_ADDENDUM}
 
 ## Your role: Trade Analyst
@@ -186,6 +189,7 @@ const analyzeTradesToolForCoordinator = tool({
 export const coordinatorAgent = new ToolLoopAgent({
   model: miniModel,
   temperature: 0.15,
+  telemetry: { functionId: "coordinator" },
   instructions: `${PERSONA}\n${COORDINATOR_ADDENDUM}
 
 Call ALL THREE tools in parallel:
