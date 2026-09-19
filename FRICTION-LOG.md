@@ -76,7 +76,7 @@ With just 4 invocations on a single route, the dashboard surfaced real problems:
 
 ![Observability dashboard for /api/roster showing 4 invocations, external API calls, and compute metrics](/docs/observability-roster-route.png)
 
-Two numbers stood out: **75% cold start rate** — 3 of 4 requests booted from scratch, meaning first requests take 8-10 seconds with 70+ API calls and a model call stacked on top. And **19.4% CPU throttle** — nearly 1 in 5 requests got slowed down because the roster endpoint makes ~72 outbound requests in a single function. The 40 Open-Meteo calls (weather for every stadium) could be batched or cached per game day, which would cut the call count and likely reduce the throttling.
+Two numbers stood out: **81.8% cold start rate** — most requests booted from scratch, meaning first requests take 8-10 seconds with 70+ API calls and a model call stacked on top. And **16.8% CPU throttle** — nearly 1 in 6 requests got slowed down because the roster endpoint makes ~72 outbound requests in a single function. The 40 Open-Meteo calls (weather for every stadium) could be batched or cached per game day, which would cut the call count and likely reduce the throttling.
 
 But every deeper question — which of the 72 calls is slowest, how much CPU time is API calls vs. processing, what's the Time to First Byte — hits a paywall or a missing link between views.
 
