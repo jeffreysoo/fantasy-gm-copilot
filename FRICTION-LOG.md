@@ -10,11 +10,7 @@
 
 ### Scoping the MVP
 
-Once I defined the product — a read-only assistant that proposes lineup, waiver, and trade moves for your real Sleeper league — I used Claude Code in the terminal and the Vercel CLI to scaffold the app, write the agents, and iterate locally. The local development experience was smooth. I could run the app on my machine (`localhost`), trigger each agent, and see results quickly.
-
-I chose 4 free, no-auth APIs as data sources: Sleeper for league and roster data, ESPN for injuries and NFL schedules, Open-Meteo for game-day weather, and FantasyCalc for trade values based on millions of real transactions. Each one was selected because it answered a specific question an agent needs: who's on my team, who's hurt, what's the weather at the stadium, and what's a player worth in a trade.
-
-I deliberately picked 4 independent data sources — not just for the product, but because multi-dependency architectures are exactly what distributed tracing is built for. When something is slow, a good trace should immediately tell you whether the bottleneck is the AI model, Sleeper, ESPN, Open-Meteo, or FantasyCalc. The architecture serves the observability story.
+A read-only assistant that proposes lineup, waiver, and trade moves for your real Sleeper league. Four agents, 4 free APIs (Sleeper, ESPN, Open-Meteo, FantasyCalc), scaffolded with Claude Code and the Vercel CLI. I deliberately picked 4 independent data sources because multi-dependency architectures are exactly what distributed tracing is built for — the architecture serves the observability story.
 
 ### The AI SDK broke silently between versions
 
@@ -44,12 +40,6 @@ This debugging surfaced the key architectural insight of the project — see [Le
 
 ## Deploying
 
-### The env var UI let me save a value with no name
-
-First deploy: the app crashed immediately. The root cause was absurd — the Vercel dashboard let me save an environment variable with a blank key name. The value was there, but the app couldn't find it because there was no key to look up. No validation error when I saved it.
-
-**What worked well:** The deployment detail page showed "No outgoing requests" under External APIs. That absence was the most useful debugging signal — it proved the crash happened before the app tried to call any external service, immediately narrowing the problem to configuration.
-
 ### AI Gateway: three walls in a row
 
 The AI Gateway advertises $5/month in free credits. I hit three blockers, each only discoverable after fixing the previous one:
@@ -58,8 +48,6 @@ The AI Gateway advertises $5/month in free credits. I hit three blockers, each o
 2. Requests to Claude models failed: "Free tier users do not have access to this model." Switched to a cheaper model (`gpt-4o-mini`).
 3. Rapid sequential requests failed with rate limiting (`429`). The free tier can't handle an agent making 2-3 API calls back to back.
 
-The error messages for problems 1 and 2 were identical — a generic 403 with no distinction between "no payment method" and "this model isn't available on your plan." A structured error that says *what's wrong* and *what to do about it* would have made each step obvious.
-
 ### Rate limits forced architectural changes
 
 The free-tier rate limits forced two workarounds that ended up shaping the app's architecture:
@@ -67,49 +55,66 @@ The free-tier rate limits forced two workarounds that ended up shaping the app's
 - **Forced parallel tool calling.** Instead of letting agents make 3-4 sequential API calls, I rewrote the instructions to say "call ALL THREE tools in a single parallel call. Do NOT call them one at a time." This cuts the number of API round-trips from 3-4 to exactly 2.
 - **Spread models across providers.** I assigned different AI models to different agents — `gpt-4o-mini` for roster and trade, `gemini-2.5-flash` for waivers, `gpt-4o` for the coordinator's final synthesis. This wasn't a quality decision — it was a rate-limit survival strategy to avoid hitting any single provider's limits.
 
-### Env var silently overwritten by a CLI command
-
-After fixing the environment variable, it broke again. Running a Vercel CLI command to link the project (`vercel link`) silently replaced my API key with an authentication token. A working deploy suddenly started failing after what appeared to be a safe, read-only command.
-
 ---
 
 ## Observing
 
 ### What works on the free tier
 
-- **Function metrics:** For each API route, I could see the status code, response time, and memory usage per request. Clicking into a specific request shows the function logs and how many external API calls it made. This was the workhorse — most of my debugging started here.
-- **Terminal log viewer** (`vercel logs`): Shows print statement output from deployed functions. Combined with print statements I added to the agent code (which tool fired, step count, elapsed time), this was my primary debugging tool.
-- **Deployment detail:** Shows a per-request count of outbound API calls. "18 external calls" vs "0 external calls" immediately tells you whether the agent ran but was slow, or never started at all.
+The free tier gives you enough to know *what* happened, but not *why*:
 
-### One API route hid all four agents
+- **Function metrics:** Status code, response time, and memory usage per request. Clicking into a request shows function logs and outbound API call count. This was the workhorse — most debugging started here.
+- **Terminal log viewer** (`vercel logs`): Print statement output from deployed functions. Combined with `console.log` statements I added to the agent code (which tool fired, step count, elapsed time), this was my primary debugging tool.
+- **Deployment detail:** Per-request count of outbound API calls. "18 external calls" vs "0 external calls" immediately tells you whether the agent ran but was slow, or never started at all.
+- **External API call counts by hostname:** I could see 40 calls to Open-Meteo, 28 to Sleeper, 4 to ESPN. The breakdown is useful — FantasyCalc not appearing confirmed the roster endpoint doesn't use trade values, validating the tool-to-API mapping.
 
-The app originally had one endpoint (`POST /api/chat`) with a parameter saying which agent to run. The monitoring dashboard showed all requests as the same route — no way to tell which agent was slow, which was hitting rate limits, or which was failing.
+This is enough to triage. You can tell if something is broken, slow, or not running at all. For a solo developer or a prototype, it covers the basics.
 
-**Fix:** I split the app into four routes — one per agent (`/api/chat/lineup`, `/api/chat/waivers`, `/api/chat/trades`, `/api/chat/coordinator`). This was an architecture change driven entirely by the monitoring tool. The single-route design was cleaner code, but invisible to monitoring. Vercel's observability works at the route level — if your app doesn't match that model, you have to reshape it.
+### What the free-tier metrics reveal (and where they stop)
 
-**What would have helped:** The ability to tag requests with custom labels (like `agent=roster-analyst`) that show up in the dashboard, without requiring separate routes.
+With just 4 invocations on a single route, the dashboard surfaced real problems:
 
-### External API calls: count but no detail
+![Observability dashboard for /api/roster showing 4 invocations, external API calls, and compute metrics](/docs/observability-roster-route.png)
 
-The deployment detail shows how many outbound requests a function made, but the URLs are blank. Just `GET` repeated 18 times — no hostnames, no paths, no timing per call. The count is accurate, but the free tier doesn't show what those calls were to.
+Two numbers stood out: **75% cold start rate** — 3 of 4 requests booted from scratch, meaning first requests take 8-10 seconds with 70+ API calls and a model call stacked on top. And **19.4% CPU throttle** — nearly 1 in 5 requests got slowed down because the roster endpoint makes ~72 outbound requests in a single function. The 40 Open-Meteo calls (weather for every stadium) could be batched or cached per game day, which would cut the call count and likely reduce the throttling.
 
-### CLI metrics: the schema says yes, the paywall says no
+But every deeper question — which of the 72 calls is slowest, how much CPU time is API calls vs. processing, what's the Time to First Byte — hits a paywall or a missing link between views.
 
-The Vercel CLI has a command that lists 95 available metrics you can query (`vercel metrics schema`). Every actual query returns: "Observability Plus is required." The schema doesn't indicate which metrics require a paid plan — it shows the full catalog as if it's all available, then blocks you when you try to use it.
+### Insights from debugging
 
-### Agent Runs: the biggest gap
+#### One API route hid all four agents
 
-The dashboard has an "Agent Runs" section in the observability sidebar. I spent the most time here trying to make it work. I configured the telemetry pipeline (OpenTelemetry via `@vercel/otel` and `@ai-sdk/otel`), set telemetry IDs on every agent, deployed, triggered multiple successful agent runs, and waited.
+The app originally had one endpoint (`POST /api/chat`) with a parameter saying which agent to run. The monitoring dashboard showed all requests as the same route — no way to tell which agent was slow or failing.
 
-Result: "No data." No error message, no setup instructions, no documentation link, no indication of whether it's a configuration issue, a plan restriction, or a timing problem.
+**Fix:** I split into four routes — one per agent (`/api/chat/lineup`, `/api/chat/waivers`, `/api/chat/trades`, `/api/chat/coordinator`). This was an architecture change driven entirely by the monitoring tool. Vercel's observability works at the route level — if your app doesn't match that model, you have to reshape it.
 
-After diagnostic logging, I found the root cause: the environment variable that provisions Vercel's telemetry collector (`VERCEL_OTEL_ENDPOINTS`) isn't set on the free plan. The telemetry data is being generated correctly, but there's no collector to receive it — the data goes nowhere.
+#### Dead route, invisible waste
 
-**The bigger observation:** Agent Runs either requires Vercel's agent framework (eve) or a paid plan (or both). The platform steers you toward eve by making observability a framework feature rather than a platform feature. If you use eve, you get Agent Runs. If you use the AI SDK directly (which Vercel also maintains), you get function logs. This isn't documented anywhere — you discover it after hours of configuring telemetry that silently does nothing.
+After a product change — removing the roster display from the landing page — the `/api/roster` route was still being called on every page load via a leftover `useEffect`. Each call makes ~72 outbound API requests (40 to Open-Meteo for weather, 28 to Sleeper for player data, 4 to ESPN for injuries). None of this data was being shown to the user.
 
-A single line in the empty state — "Agent Runs requires eve or a Pro plan" — would save significant debugging time and let developers make this framework decision up front.
+The dashboard surfaced the symptom — I could see the route making dozens of external calls — but couldn't tell the calls were wasteful because the External APIs view shows count without detail. It took cross-referencing function metrics with the actual production UI to realize the route was doing real work that served no purpose.
 
-### Three views, no connections between them
+#### Agent Runs: the biggest gap
+
+The dashboard has an "Agent Runs" section in the observability sidebar. I configured the telemetry pipeline (OpenTelemetry via `@vercel/otel` and `@ai-sdk/otel`), set telemetry IDs on every agent, deployed, and triggered multiple successful agent runs.
+
+Result: "No data." No error message, no setup instructions, no indication of whether it's a configuration issue or a plan restriction.
+
+After diagnostic logging, I found the root cause: the environment variable that provisions Vercel's telemetry collector (`VERCEL_OTEL_ENDPOINTS`) isn't set on the free plan. The telemetry data is generated correctly, but there's no collector to receive it — the data goes nowhere.
+
+### The tiering makes business sense — the friction is discovering it
+
+The free-vs-paid line is well-placed. Free tier gives you **triage**: *Is it working? Is it slow? Is it calling the right things?* Status codes, response times, call counts, cold start rates. This covers the debugging loop for solo developers and prototypes — and it's what I used for 90% of my debugging.
+
+Pro tier gives you **diagnosis**: Once you know *something* is slow, you need to know *which part*. Per-hostname latency, Time to First Byte, error rates by external dependency, the full metrics catalog. This is where the platform earns revenue — when you're running production traffic and the cost of not knowing is real.
+
+That split makes sense. The friction isn't the paywall — it's investing time in configuration before discovering the paywall:
+
+- The CLI lists 95 available metrics (`vercel metrics schema`), then blocks every query with "Observability Plus is required." The schema should indicate which metrics require a paid plan — showing the full catalog as if it's available, then blocking at query time, wastes debugging cycles.
+- Agent Runs shows an empty state with no explanation — not "requires Pro" or "requires eve," just "No data." I spent hours configuring the telemetry pipeline (OpenTelemetry, `@vercel/otel`, `@ai-sdk/otel`, telemetry IDs on every agent) before discovering the collector endpoint isn't provisioned on the free plan. A single line in the empty state would have saved that entire detour.
+- External API call counts show the hostname but lock latency and error rates behind a Pro icon. The count alone tells you the *shape* of the request — the locked metrics tell you the *health*. This one is actually well-communicated: the lock icon sets expectations clearly.
+
+### Three views, no connections — and why I'd use eve next
 
 Function metrics, AI Gateway, and External APIs exist as separate views. I can see that a request to `/api/chat/lineup` took 6.2 seconds, that the AI Gateway handled a model call, and that there were 8 outbound API requests. But there's no way to connect them: "this specific function call triggered these model calls and these external requests."
 
@@ -125,7 +130,9 @@ POST /api/chat/lineup (6.2s)
        └─ Step 1: response (1.2s)
 ```
 
-Instead, you get three disconnected views of the same request. The tracing infrastructure exists — the platform has telemetry support and span propagation — but the free-tier dashboard doesn't stitch them together.
+Instead, you get three disconnected views. The tracing infrastructure exists — the platform has telemetry support and span propagation — but the dashboard doesn't stitch them together.
+
+This is the main reason I'd use Vercel's eve framework if I were rebuilding this for production. With the AI SDK, I had to manufacture my own observability — splitting routes so agents show up separately in the dashboard, adding print statements to reconstruct which tools fired, manually cross-referencing three views to debug a single request. Eve's Agent Runs trace waterfall gives you the connected view out of the box: one trace per agent run, with every tool call, model call, and sub-agent visible in a single timeline.
 
 ---
 
@@ -139,9 +146,7 @@ A cleaner architecture with fewer, smarter tools would have mostly just worked �
 
 ### What I learned: the debugging revealed a design principle
 
-The only way to see what agents were actually doing on the free tier was print statements (`console.log`) piped through the terminal log viewer (`vercel logs`). Agent Runs didn't work on the free plan, the dashboard only shows route-level metrics, and external API calls showed count but no detail. I was reconstructing agent behavior — which tools fired, in what order, what they returned — from manual log output.
-
-That manual debugging is what made the pattern visible. Every rule I added to the agent's instructions was the same shape: compensating for a tool design problem at the prompt layer.
+The manual debugging described above is what made the pattern visible. Every rule I added to the agent's instructions was the same shape: compensating for a tool design problem at the prompt layer.
 
 | Rule I added to the prompt | Actual root cause |
 |---|---|
@@ -164,19 +169,7 @@ The rule is simple:
 
 ### What I would do next: migrate to eve
 
-If I were building this for production rather than a friction log, I'd start with Vercel's agent framework (eve). Eve would have nudged toward the "fat tools, thin agents" pattern from the start — not because it forces better tool design, but because its built-in observability removes the need to engineer for debuggability. With the AI SDK, I needed many independent tool calls to create debugging surface area because the platform couldn't show me what was happening otherwise. With eve, the traces come for free, so you can skip straight to engineering for correctness.
-
-| | AI SDK v7 (what I used) | Eve (what I'd use next) |
-|---|---|---|
-| **Level** | Low-level, full control | Higher-level, convention-driven |
-| **Portability** | Framework-agnostic, runs anywhere | Vercel-native, deeper platform lock-in |
-| **Agent structure** | Manual — you wire agents, tools, and routes yourself | File-based — agents are folders, tools are files, sub-agents are subdirectories |
-| **Observability** | Do-it-yourself — route splitting, print statements, manual log review | Built-in — Agent Runs trace waterfall works out of the box |
-| **Error handling** | Manual — if a sub-agent fails, the coordinator doesn't know | Durable workflows — automatic retries and step-level resumability |
-| **Natural gravity** | Many small tools, because nothing pushes you toward composing them | Fewer composed tools, because you can see what's happening without manufacturing surface area |
-| **Best for** | Prototyping, friction logs, portable agents | Production multi-agent systems scaling to more agents |
-
-**The tradeoff:** Eve deepens lock-in to Vercel-specific infrastructure (Workflows, Sandbox), and sub-agent calls become asynchronous — changing the user experience from a single synchronous response to potentially polling for completion. The AI SDK is framework-agnostic and runs anywhere. For a 4-agent system, that portability matters. For a production app scaling to more agents, eve's conventions pay for themselves.
+If I were building this for production rather than a friction log, I'd start with eve. As described in the observability section, the AI SDK forced me to manufacture my own debugging surface area. Eve's built-in traces would have let me skip straight to engineering for correctness — and would have nudged toward the "fat tools, thin agents" pattern from the start. The tradeoff is lock-in to Vercel-specific infrastructure, but for a multi-agent app where the hardest problem is debugging across agents, built-in observability pays for itself.
 
 ---
 
@@ -184,7 +177,4 @@ If I were building this for production rather than a friction log, I'd start wit
 
 1. **Environment variable validation at deploy time.** "Your function reads `AI_GATEWAY_API_KEY` but no variable with that name is configured." The code and the variable list are both available at build time — this is static analysis.
 2. **Rate limit visibility.** A gauge showing "8/10 requests used this minute" for the AI Gateway. The rate limit error comes with no warning and minimal information about when the limit resets.
-3. **Agent Runs empty state that explains itself.** "Requires eve framework" or "Requires Pro plan" — anything other than "No data."
-4. **Request-level trace linking.** Click a function call, see all downstream calls — model, tools, external APIs — in a single waterfall view. The data exists across three separate views. Connecting them is the product gap.
-5. **Custom metric labels.** Let users tag function calls with attributes like `agent=roster-analyst` that show up in the dashboard. This would make the route-splitting workaround unnecessary for multi-agent apps.
-6. **Grounding checks for AI output.** Automatically compare numbers cited in the model's response against numbers in the tool call results. The structured data is already in the system — the check is: does the output contain values that don't appear in any tool result?
+3. **Request-level trace linking.** Click a function call, see all downstream calls — model, tools, external APIs — in a single waterfall view. The data exists across three separate views. Connecting them is the product gap.
