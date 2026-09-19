@@ -655,3 +655,181 @@ export const getTradeValuesTool = tool({
     return values.slice(0, topN);
   },
 });
+
+export const findTradeTargetsTool = tool({
+  description:
+    "Scans all league rosters to find realistic trade opportunities. Returns your roster's weak positions, other managers' surplus players at those positions, and pre-calculated trade value comparisons. Every result is ownership-verified — no free agents, no guessing.",
+  inputSchema: z.object({
+    maxValueGapPercent: z
+      .number()
+      .describe("Maximum allowed trade value gap percentage between sides")
+      .default(25),
+  }),
+  execute: async ({ maxValueGapPercent }) => {
+    const userId = await getUserId(SLEEPER_USERNAME);
+    const leagues = await getLeagues(userId);
+    if (!leagues.length) return { error: "No leagues found" };
+
+    const league = leagues[0];
+    const nflState = await getNFLState();
+    const currentWeek = nflState.week || 1;
+
+    const [rosters, users, players, tradeValuesList, projections] = await Promise.all([
+      getRosters(league.league_id),
+      getLeagueUsers(league.league_id),
+      getPlayersMap(),
+      getTradeValues({ numTeams: league.settings?.num_teams || 8 }),
+      getPlayerProjections(nflState.season || "2026", currentWeek),
+    ]);
+
+    const userMap = Object.fromEntries(
+      users.map((u: Record<string, unknown>) => [u.user_id, u.display_name])
+    );
+
+    // Trade value lookup by player name
+    const valueByName: Record<string, number> = {};
+    for (const tv of tradeValuesList) {
+      valueByName[tv.name.toLowerCase()] = tv.value;
+    }
+
+    const getPlayerValue = (name: string): number =>
+      valueByName[name.toLowerCase()] || 0;
+
+    // Find my roster
+    const myRoster = rosters.find(
+      (r: Record<string, unknown>) => r.owner_id === userId
+    );
+    if (!myRoster) return { error: "Roster not found" };
+
+    const mySettings = myRoster.settings as Record<string, number> | undefined;
+
+    // Build my roster with projections and trade values
+    const starterPositions = ["QB", "RB", "WR", "TE"];
+    const myPlayers = ((myRoster.players || []) as string[]).map((id: string) => {
+      const p = players[id];
+      if (!p) return null;
+      const proj = projections[id];
+      return {
+        player_id: id,
+        name: p.full_name || id,
+        position: p.position,
+        team: p.team,
+        starter: ((myRoster.starters || []) as string[]).includes(id),
+        projected_pts: proj?.pts_ppr ?? proj?.pts_std ?? 0,
+        trade_value: getPlayerValue(p.full_name || ""),
+        injury_status: p.injury_status || "healthy",
+      };
+    }).filter(Boolean) as Array<{
+      player_id: string; name: string; position: string;
+      team: string | null; starter: boolean; projected_pts: number;
+      trade_value: number; injury_status: string;
+    }>;
+
+    // Identify weak positions: lowest projected starter at each position
+    const myStartersByPos: Record<string, typeof myPlayers> = {};
+    for (const p of myPlayers) {
+      if (p.starter && starterPositions.includes(p.position)) {
+        if (!myStartersByPos[p.position]) myStartersByPos[p.position] = [];
+        myStartersByPos[p.position].push(p);
+      }
+    }
+
+    const weakPositions = starterPositions
+      .map((pos) => {
+        const starters = myStartersByPos[pos] || [];
+        if (!starters.length) return { position: pos, weakest_starter: null, projected_pts: 0 };
+        const weakest = starters.sort((a, b) => a.projected_pts - b.projected_pts)[0];
+        return { position: pos, weakest_starter: weakest.name, projected_pts: weakest.projected_pts, trade_value: weakest.trade_value };
+      })
+      .sort((a, b) => a.projected_pts - b.projected_pts);
+
+    // My tradeable bench players (surplus): bench players with trade value
+    const myBench = myPlayers
+      .filter((p) => !p.starter && p.trade_value > 0 && starterPositions.includes(p.position))
+      .sort((a, b) => b.trade_value - a.trade_value);
+
+    // Scan all other rosters for trade candidates
+    const tradeCandidates: Array<{
+      target_player: string;
+      target_position: string;
+      target_team: string | null;
+      target_value: number;
+      target_projected_pts: number;
+      owned_by: string;
+      owner_record: string;
+      owner_roster_id: number;
+      // Best trade chip from my bench
+      send_player: string;
+      send_position: string;
+      send_value: number;
+      value_gap: number;
+      value_gap_percent: number;
+    }> = [];
+
+    for (const roster of rosters) {
+      const r = roster as unknown as Record<string, unknown>;
+      if (r.owner_id === userId) continue;
+
+      const rSettings = r.settings as Record<string, number> | undefined;
+      const ownerName = userMap[r.owner_id as string] || "Unknown";
+      const ownerRecord = `${rSettings?.wins || 0}-${rSettings?.losses || 0}`;
+      const rosterPlayers = (r.players || []) as string[];
+      const rosterStarters = new Set((r.starters || []) as string[]);
+
+      for (const pid of rosterPlayers) {
+        const p = players[pid];
+        if (!p || !p.full_name || !starterPositions.includes(p.position)) continue;
+
+        const targetValue = getPlayerValue(p.full_name);
+        if (targetValue <= 0) continue;
+
+        const proj = projections[pid];
+        const targetProjPts = proj?.pts_ppr ?? proj?.pts_std ?? 0;
+
+        // Is this player at one of my weak positions and better than my starter?
+        const myWeakAtPos = weakPositions.find((w) => w.position === p.position);
+        if (!myWeakAtPos || targetProjPts <= myWeakAtPos.projected_pts) continue;
+
+        // Find the best trade chip from my bench that's within value range
+        for (const chip of myBench) {
+          const gap = Math.abs(targetValue - chip.trade_value);
+          const gapPercent = targetValue > 0 ? Math.round((gap / targetValue) * 100) : 100;
+
+          if (gapPercent <= maxValueGapPercent) {
+            tradeCandidates.push({
+              target_player: p.full_name,
+              target_position: p.position,
+              target_team: p.team,
+              target_value: targetValue,
+              target_projected_pts: Math.round(targetProjPts * 10) / 10,
+              owned_by: ownerName,
+              owner_record: ownerRecord,
+              owner_roster_id: r.roster_id as number,
+              send_player: chip.name,
+              send_position: chip.position,
+              send_value: chip.trade_value,
+              value_gap: targetValue - chip.trade_value,
+              value_gap_percent: gapPercent,
+            });
+            break; // best chip per target
+          }
+        }
+      }
+    }
+
+    // Sort by upgrade potential (projected pts gain)
+    tradeCandidates.sort((a, b) => b.target_projected_pts - a.target_projected_pts);
+
+    return {
+      my_record: `${mySettings?.wins || 0}-${mySettings?.losses || 0}`,
+      weak_positions: weakPositions,
+      my_tradeable_bench: myBench.map((p) => ({
+        name: p.name,
+        position: p.position,
+        trade_value: p.trade_value,
+      })),
+      trade_candidates: tradeCandidates.slice(0, 8),
+      note: "All candidates are ownership-verified. Every target is rostered by the named manager.",
+    };
+  },
+});

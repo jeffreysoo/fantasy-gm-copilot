@@ -13,6 +13,7 @@ import {
   getWeatherTool,
   getTradeValuesTool,
   getProjectionsTool,
+  findTradeTargetsTool,
 } from "./tools";
 import { PERSONA, COORDINATOR_ADDENDUM, SUB_AGENT_ADDENDUM } from "./system-prompt";
 
@@ -28,6 +29,7 @@ const gpt4oModel = gateway("openai/gpt-4o");
 
 // --- Sub-agent: Roster Analyst ---
 export const rosterAnalyst = new ToolLoopAgent({
+  id: "roster-analyst",
   model: miniModel,
   temperature: 0.15,
   telemetry: { functionId: "roster-analyst" },
@@ -77,6 +79,7 @@ Tier each player: Tier 1 (must-start), Tier 2 (solid), Tier 3 (risky/upside). Gr
 
 // --- Sub-agent: Waiver Scout ---
 export const waiverScout = new ToolLoopAgent({
+  id: "waiver-scout",
   model: geminiModel,
   temperature: 0.15,
   telemetry: { functionId: "waiver-scout" },
@@ -111,41 +114,38 @@ List adds in priority order. For each add, use this format:
 
 // --- Sub-agent: Trade Analyst ---
 export const tradeAnalyst = new ToolLoopAgent({
+  id: "trade-analyst",
   model: miniModel,
   temperature: 0.15,
   telemetry: { functionId: "trade-analyst" },
   instructions: `${PERSONA}\n${SUB_AGENT_ADDENDUM}
 
 ## Your role: Trade Analyst
-Call these tools:
-- getTradeValues: get trade values for analysis
-- getRoster: see the user's current roster to identify trade chips and weak positions
-- getPlayerCurrentOwner: check who owns target players (CRITICAL — call this for EVERY player you want to propose in a trade)
-- getPlayerStats: check recent performance to back up your reasoning
+Call findTradeTargets first — it scans every roster in the league, identifies your weak positions, finds upgrade targets owned by other managers, and returns pre-calculated trade value comparisons. All results are ownership-verified.
+
+Use getTradeValues only if you need to look up additional player values for a 2-for-1 package or to compare alternatives.
 
 ## Output format
 For each trade, use this exact format:
 **Trade [number]: [Your Player] → [Their Player]**
-Send: [Player A] ([Position], value: [X]) to [Owner Name]
+Send: [Player A] ([Position], value: [X]) to [Owner Name] ([Record])
 Receive: [Player B] ([Position], value: [Y]) from [Owner Name]
-Value gap: [X - Y] ([percentage]%)
-Why: [One sentence: what roster hole this fills and what surplus you're trading from.]
+Value gap: [difference] ([percentage]%)
+Why: [One sentence: what position weakness this fixes and why the other manager might accept.]
 
 ## Rules
-- Only propose trades for players confirmed owned by another team via getPlayerCurrentOwner. If a player is a free agent, they are a waiver pickup, NOT a trade target. Never propose a trade for an unowned player.
-- Show the math: trade values for both sides, the gap, and the percentage. Both sides must be within 20% value.
-- Identify the user's weakest starting position by comparing projected points across the roster, then target an upgrade there.
-- Maximum 2 trade proposals. Each must be with a different league manager.
-- Do NOT fabricate weekly stats, historical performance, or projections the tools didn't return.
+- Only propose trades from the findTradeTargets results. Every candidate is already ownership-verified — do not second-guess it.
+- Show the math: trade values for both sides, the gap, and the percentage.
+- Prefer targeting managers with losing records — they're more likely to accept value-balanced deals for position needs.
+- Maximum 3 trade proposals. Each must be with a different league manager.
+- Do NOT fabricate stats the tools didn't return.
 - No filler. No "struggling last season" or "has upside." Only cite data from the tools.
 - End on the last trade. No summary.`,
   tools: {
+    findTradeTargets: findTradeTargetsTool,
     getTradeValues: getTradeValuesTool,
-    getRoster: getRosterTool,
-    getPlayerCurrentOwner: getPlayerCurrentOwnerTool,
-    getPlayerStats: getPlayerStatsTool,
   },
-  stopWhen: isStepCount(6),
+  stopWhen: isStepCount(4),
 });
 
 // --- Wrap sub-agents as tools for the coordinator ---
@@ -187,6 +187,7 @@ const analyzeTradesToolForCoordinator = tool({
 
 // --- Coordinator agent ---
 export const coordinatorAgent = new ToolLoopAgent({
+  id: "coordinator",
   model: miniModel,
   temperature: 0.15,
   telemetry: { functionId: "coordinator" },
